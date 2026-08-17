@@ -33,3 +33,6 @@ Or specify a custom output directory:
 ```bash
 ./cue2pops --output "path/to/folder/" "path/to/file.cue"
 ```
+
+## Credits
+[ErikAndren](https://github.com/ErikAndren)
