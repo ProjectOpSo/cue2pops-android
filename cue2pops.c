@@ -16,8 +16,8 @@
 #include <ctype.h>
 
 const int SECTORSIZE = 2352; 
-
-#define HEADERSIZE 0x40000
+#define VCD_HEADER_SIZE 0x100000
+#define IO_BUFFER_SIZE  0x40000
 
 int pregap_count = 0; 
 int postgap_count = 0; 
@@ -128,7 +128,7 @@ void game_identifier(unsigned char *inbuf, parameters *p)
 	}
 
 	if (p->game_title == 0) {
-		for (ptr = 0; ptr < HEADERSIZE - 16; ptr += 4) {
+		for (ptr = 0; ptr < IO_BUFFER_SIZE - 16; ptr += 4) {
 			for (size_t s = 0; s < NUM_SIGNATURES; s++) {
 				if (memcmp(&inbuf[ptr], GAME_SIGNATURES[s].sig, GAME_SIGNATURES[s].len) == 0) {
 					printf("----------------------------------------------------------------------------------\n");
@@ -159,7 +159,7 @@ void game_fixer(unsigned char *inbuf, parameters *p)
 {
 	int ptr;
 	if (p->game_fixed == 0) {
-		for (ptr = 0; ptr < HEADERSIZE - 8; ptr += 4) {
+		for (ptr = 0; ptr < IO_BUFFER_SIZE - 8; ptr += 4) {
 			if (p->game_title == 4) {
 				if (inbuf[ptr] == 0x78 && inbuf[ptr+1] == 0x26 && inbuf[ptr+2] == 0x43 && inbuf[ptr+3] == 0x8C) inbuf[ptr] = 0x74;
 				if (inbuf[ptr] == 0xE8 && inbuf[ptr+1] == 0x75 && inbuf[ptr+2] == 0x06 && inbuf[ptr+3] == 0x80) {
@@ -177,7 +177,7 @@ void game_trainer(unsigned char *inbuf, parameters *p)
 {
 	int ptr;
 	if (p->game_trained == 0) {
-		for (ptr = 0; ptr < HEADERSIZE - 4; ptr += 4) {
+		for (ptr = 0; ptr < IO_BUFFER_SIZE - 4; ptr += 4) {
 			if (p->game_title == 1 && inbuf[ptr] == 0x7C && inbuf[ptr+1] == 0x16 && inbuf[ptr+2] == 0x20 && inbuf[ptr+3] == 0xAC) {
 				inbuf[ptr+2] = 0x22;
 				printf("game_trainer : Test Save System Enabled\n");
@@ -275,9 +275,9 @@ int main(int argc, char **argv)
 	parameters params;
 	memset(&params, 0, sizeof(params));
 
-	printf("\nBIN/CUE to IMAGE0.VCD conversion tool v2.0 (Android/Termux Optimized)\n");
+	printf("\nBIN/CUE to IMAGE0.VCD conversion tool v2.0 (Android/Termux Fixed)\n");
 
-	check_available_ram(HEADERSIZE * 3);
+	check_available_ram(VCD_HEADER_SIZE + IO_BUFFER_SIZE);
 
 	if (argc <= 1) {
 		printf("Usage: %s [options] <input.cue> [output.vcd]\n", argv[0]);
@@ -485,7 +485,7 @@ int main(int argc, char **argv)
 		printf("[INFO] Output VCD path: %s\n", final_vcd_path);
 	}
 
-	headerbuf = calloc(1, HEADERSIZE);
+	headerbuf = calloc(1, VCD_HEADER_SIZE);
 	if (!headerbuf) {
 		log_error("Failed to allocate header buffer", NULL);
 		free(cue_buf);
@@ -533,7 +533,7 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	outbuf = malloc(HEADERSIZE);
+	outbuf = malloc(IO_BUFFER_SIZE);
 	if (!outbuf) {
 		log_error("Cannot allocate conversion buffer", NULL);
 		fclose(bin_file); fclose(vcd_file); free(cue_buf); free(bin_path); free(headerbuf);
@@ -541,7 +541,7 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	if (fread(outbuf, HEADERSIZE, 1, bin_file) == 1) {
+	if (fread(outbuf, 1, IO_BUFFER_SIZE, bin_file) > 0) {
 		game_identifier(outbuf, &params);
 		game_fixer(outbuf, &params);
 		game_trainer(outbuf, &params);
@@ -552,7 +552,7 @@ int main(int argc, char **argv)
 	memcpy(headerbuf + 1032, &sector_count, 3);
 	memcpy(headerbuf + 1036, &sector_count, 3);
 
-	fwrite(headerbuf, HEADERSIZE, 1, vcd_file);
+	fwrite(headerbuf, VCD_HEADER_SIZE, 1, vcd_file);
 
 	log_info(&params, "Writing BIN sectors to VCD...");
 
@@ -560,7 +560,7 @@ int main(int argc, char **argv)
 	int64_t total_written = 0;
 	int last_percent = -1;
 
-	while ((bytes_read = fread(outbuf, 1, HEADERSIZE, bin_file)) > 0) {
+	while ((bytes_read = fread(outbuf, 1, IO_BUFFER_SIZE, bin_file)) > 0) {
 		if (fwrite(outbuf, 1, bytes_read, vcd_file) != bytes_read) {
 			log_error("Writing failure during VCD creation", final_vcd_path);
 			fclose(bin_file); fclose(vcd_file);
