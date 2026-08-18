@@ -16,7 +16,8 @@
 #include <ctype.h>
 
 const int SECTORSIZE = 2352; 
-const int HEADERSIZE = 0x100000; 
+
+#define HEADERSIZE 0x40000
 
 int pregap_count = 0; 
 int postgap_count = 0; 
@@ -37,6 +38,21 @@ typedef struct {
 	int game_fixed;
 } parameters;
 
+typedef struct {
+	const char *sig;
+	size_t len;
+	const char *name;
+	int title_id;
+	int deny_vmode;
+} GameSignature;
+
+static const GameSignature GAME_SIGNATURES[] = {
+	{"SCES-00344", 10, "Crash Bandicoot [SCES-00344]", 1, 1},
+	{"SCUS-94900", 10, "Crash Bandicoot [SCUS-94900]", 2, 0},
+	{"SCPS-10031", 10, "Crash Bandicoot [SCPS-10031]", 3, 0}
+};
+static const size_t NUM_SIGNATURES = sizeof(GAME_SIGNATURES) / sizeof(GAME_SIGNATURES[0]);
+
 static void log_error(const char *msg, const char *detail) {
 	if (detail && strlen(detail) > 0) {
 		fprintf(stderr, "[ERROR] %s: %s (errno=%d: %s)\n", msg, detail, errno, strerror(errno));
@@ -48,6 +64,30 @@ static void log_error(const char *msg, const char *detail) {
 static void log_info(const parameters *p, const char *msg) {
 	if (p->verbose || p->debug_cue) {
 		printf("[INFO] %s\n", msg);
+	}
+}
+
+static void check_available_ram(size_t required_bytes) {
+	FILE *fp = fopen("/proc/meminfo", "r");
+	if (!fp) return;
+
+	char line[128];
+	long mem_available_kb = -1;
+
+	while (fgets(line, sizeof(line), fp)) {
+		if (sscanf(line, "MemAvailable: %ld kB", &mem_available_kb) == 1) {
+			break;
+		}
+	}
+	fclose(fp);
+
+	if (mem_available_kb > 0) {
+		long required_kb = (long)(required_bytes / 1024);
+		if (mem_available_kb < required_kb) {
+			fprintf(stderr, "[WARNING] Pouca RAM disponível (%ld kB). Recomendado ao menos %ld kB.\n", 
+					mem_available_kb, required_kb);
+			fprintf(stderr, "[WARNING] O processamento pode ficar lento ou ser suspenso pelo Android.\n");
+		}
 	}
 }
 
@@ -89,34 +129,21 @@ void game_identifier(unsigned char *inbuf, parameters *p)
 
 	if (p->game_title == 0) {
 		for (ptr = 0; ptr < HEADERSIZE - 16; ptr += 4) {
-			if (inbuf[ptr] == 'S' && inbuf[ptr+1] == 'C' && inbuf[ptr+2] == 'E' && inbuf[ptr+3] == 'S' && inbuf[ptr+4] == '-' && inbuf[ptr+5] == '0' && inbuf[ptr+6] == '0' && inbuf[ptr+7] == '3' && inbuf[ptr+8] == '4' && inbuf[ptr+9] == '4') {
-				printf("----------------------------------------------------------------------------------\n");
-				printf("Crash Bandicoot [SCES-00344]\n");
-				p->deny_vmode++;
-				p->game_title = 1;
-				p->game_has_cheats = 1;
-				p->fix_game = 0;
-				break;
-			}
-			if (inbuf[ptr] == 'S' && inbuf[ptr+1] == 'C' && inbuf[ptr+2] == 'U' && inbuf[ptr+3] == 'S' && inbuf[ptr+4] == '-' && inbuf[ptr+5] == '9' && inbuf[ptr+6] == '4' && inbuf[ptr+7] == '9' && inbuf[ptr+8] == '0' && inbuf[ptr+9] == '0') {
-				printf("----------------------------------------------------------------------------------\n");
-				printf("Crash Bandicoot [SCUS-94900]\n");
-				p->game_title = 2;
-				p->game_has_cheats = 1;
-				p->fix_game = 0;
-				break;
-			}
-			if (inbuf[ptr] == 'S' && inbuf[ptr+1] == 'C' && inbuf[ptr+2] == 'P' && inbuf[ptr+3] == 'S' && inbuf[ptr+4] == '_' && inbuf[ptr+5] == '1' && inbuf[ptr+6] == '0' && inbuf[ptr+7] == '0' && inbuf[ptr+8] == '3' && inbuf[ptr+9] == '1') {
-				printf("----------------------------------------------------------------------------------\n");
-				printf("Crash Bandicoot [SCPS-10031]\n");
-				p->game_title = 3;
-				p->game_has_cheats = 1;
-				p->fix_game = 0;
-				break;
+			for (size_t s = 0; s < NUM_SIGNATURES; s++) {
+				if (memcmp(&inbuf[ptr], GAME_SIGNATURES[s].sig, GAME_SIGNATURES[s].len) == 0) {
+					printf("----------------------------------------------------------------------------------\n");
+					printf("%s\n", GAME_SIGNATURES[s].name);
+					if (GAME_SIGNATURES[s].deny_vmode) p->deny_vmode++;
+					p->game_title = GAME_SIGNATURES[s].title_id;
+					p->game_has_cheats = 1;
+					p->fix_game = 0;
+					goto found_title;
+				}
 			}
 		}
 	}
 
+found_title:
 	if (p->game_title != 0 && p->fix_game == 1) {
 		printf("GameFixer is ON\n");
 	}
@@ -248,7 +275,9 @@ int main(int argc, char **argv)
 	parameters params;
 	memset(&params, 0, sizeof(params));
 
-	printf("\nBIN/CUE to IMAGE0.VCD conversion tool v2.0 (Android Fixed)\n");
+	printf("\nBIN/CUE to IMAGE0.VCD conversion tool v2.0 (Android/Termux Optimized)\n");
+
+	check_available_ram(HEADERSIZE * 3);
 
 	if (argc <= 1) {
 		printf("Usage: %s [options] <input.cue> [output.vcd]\n", argv[0]);
@@ -279,12 +308,16 @@ int main(int argc, char **argv)
 
 	if (!cue_name) {
 		fprintf(stderr, "[ERROR] No input CUE file specified\n");
+		if (out_dir) free(out_dir);
 		return 1;
 	}
 
 	if (!is_cue(cue_name)) {
 		log_error("Cannot open or access CUE file", cue_name);
 		fprintf(stderr, "[FAIL] %s\n", cue_name);
+		if (out_dir) free(out_dir);
+		free(cue_name);
+		if (vcd_name) free(vcd_name);
 		return 1;
 	}
 
@@ -301,6 +334,9 @@ int main(int argc, char **argv)
 	if (cue_size <= 0) {
 		log_error("Invalid or empty CUE file", cue_name);
 		fprintf(stderr, "[FAIL] %s\n", cue_name);
+		if (out_dir) free(out_dir);
+		free(cue_name);
+		if (vcd_name) free(vcd_name);
 		return 1;
 	}
 
@@ -308,6 +344,9 @@ int main(int argc, char **argv)
 	if (!cue_file) {
 		log_error("Failed opening CUE file", cue_name);
 		fprintf(stderr, "[FAIL] %s\n", cue_name);
+		if (out_dir) free(out_dir);
+		free(cue_name);
+		if (vcd_name) free(vcd_name);
 		return 1;
 	}
 
@@ -315,6 +354,9 @@ int main(int argc, char **argv)
 	if (!cue_buf) {
 		log_error("Memory allocation failed for CUE buffer", NULL);
 		fclose(cue_file);
+		if (out_dir) free(out_dir);
+		free(cue_name);
+		if (vcd_name) free(vcd_name);
 		return 1;
 	}
 
@@ -322,6 +364,9 @@ int main(int argc, char **argv)
 		log_error("Failed reading CUE buffer", cue_name);
 		free(cue_buf);
 		fclose(cue_file);
+		if (out_dir) free(out_dir);
+		free(cue_name);
+		if (vcd_name) free(vcd_name);
 		return 1;
 	}
 	fclose(cue_file);
@@ -331,6 +376,9 @@ int main(int argc, char **argv)
 		fprintf(stderr, "[ERROR] Invalid CUE format: FILE directive not found\n");
 		free(cue_buf);
 		fprintf(stderr, "[FAIL] %s\n", cue_name);
+		if (out_dir) free(out_dir);
+		free(cue_name);
+		if (vcd_name) free(vcd_name);
 		return 1;
 	}
 
@@ -344,6 +392,9 @@ int main(int argc, char **argv)
 		if (!end_quote) {
 			fprintf(stderr, "[ERROR] Invalid CUE format: Closing quote for FILE missing\n");
 			free(cue_buf);
+			if (out_dir) free(out_dir);
+			free(cue_name);
+			if (vcd_name) free(vcd_name);
 			return 1;
 		}
 		strncpy(extracted_bin, cue_ptr, end_quote - cue_ptr);
@@ -352,7 +403,7 @@ int main(int argc, char **argv)
 		if (end_space) {
 			strncpy(extracted_bin, cue_ptr, end_space - cue_ptr);
 		} else {
-			strcpy(extracted_bin, cue_ptr);
+			strncpy(extracted_bin, cue_ptr, sizeof(extracted_bin) - 1);
 		}
 	}
 
@@ -364,6 +415,9 @@ int main(int argc, char **argv)
 	if (!bin_path) {
 		log_error("Memory allocation failed for BIN path", NULL);
 		free(cue_buf);
+		if (out_dir) free(out_dir);
+		free(cue_name);
+		if (vcd_name) free(vcd_name);
 		return 1;
 	}
 
@@ -383,6 +437,9 @@ int main(int argc, char **argv)
 		free(cue_buf);
 		free(bin_path);
 		fprintf(stderr, "[FAIL] %s\n", cue_name);
+		if (out_dir) free(out_dir);
+		free(cue_name);
+		if (vcd_name) free(vcd_name);
 		return 1;
 	}
 
@@ -391,8 +448,11 @@ int main(int argc, char **argv)
 	}
 
 	char base_vcd_name[256] = {0};
-	char *cue_filename = basename(strdup(cue_name));
+	char *tmp_cue_dup = strdup(cue_name);
+	char *cue_filename = basename(tmp_cue_dup);
 	strncpy(base_vcd_name, cue_filename, sizeof(base_vcd_name) - 1);
+	free(tmp_cue_dup);
+
 	char *dot = strrchr(base_vcd_name, '.');
 	if (dot) *dot = '\0';
 	strcat(base_vcd_name, ".VCD");
@@ -404,6 +464,9 @@ int main(int argc, char **argv)
 			log_error("Cannot create output directory", out_dir);
 			free(cue_buf);
 			free(bin_path);
+			free(out_dir);
+			free(cue_name);
+			if (vcd_name) free(vcd_name);
 			return 1;
 		}
 		size_t len = strlen(out_dir);
@@ -427,6 +490,9 @@ int main(int argc, char **argv)
 		log_error("Failed to allocate header buffer", NULL);
 		free(cue_buf);
 		free(bin_path);
+		if (out_dir) free(out_dir);
+		free(cue_name);
+		if (vcd_name) free(vcd_name);
 		return 1;
 	}
 
@@ -447,6 +513,7 @@ int main(int argc, char **argv)
 	if (track_count == 0 || track_count != index1_count) {
 		fprintf(stderr, "[ERROR] Invalid CUE structure: Track count mismatch\n");
 		free(cue_buf); free(bin_path); free(headerbuf);
+		if (out_dir) free(out_dir); free(cue_name); if (vcd_name) free(vcd_name);
 		return 1;
 	}
 
@@ -454,6 +521,7 @@ int main(int argc, char **argv)
 	if (!bin_file) {
 		log_error("Cannot open BIN file for processing", bin_path);
 		free(cue_buf); free(bin_path); free(headerbuf);
+		if (out_dir) free(out_dir); free(cue_name); if (vcd_name) free(vcd_name);
 		return 1;
 	}
 
@@ -461,6 +529,7 @@ int main(int argc, char **argv)
 	if (!vcd_file) {
 		log_error("Cannot create VCD output file", final_vcd_path);
 		fclose(bin_file); free(cue_buf); free(bin_path); free(headerbuf);
+		if (out_dir) free(out_dir); free(cue_name); if (vcd_name) free(vcd_name);
 		return 1;
 	}
 
@@ -468,6 +537,7 @@ int main(int argc, char **argv)
 	if (!outbuf) {
 		log_error("Cannot allocate conversion buffer", NULL);
 		fclose(bin_file); fclose(vcd_file); free(cue_buf); free(bin_path); free(headerbuf);
+		if (out_dir) free(out_dir); free(cue_name); if (vcd_name) free(vcd_name);
 		return 1;
 	}
 
@@ -487,12 +557,24 @@ int main(int argc, char **argv)
 	log_info(&params, "Writing BIN sectors to VCD...");
 
 	size_t bytes_read;
+	int64_t total_written = 0;
+	int last_percent = -1;
+
 	while ((bytes_read = fread(outbuf, 1, HEADERSIZE, bin_file)) > 0) {
 		if (fwrite(outbuf, 1, bytes_read, vcd_file) != bytes_read) {
 			log_error("Writing failure during VCD creation", final_vcd_path);
 			fclose(bin_file); fclose(vcd_file);
 			free(cue_buf); free(bin_path); free(headerbuf); free(outbuf);
+			if (out_dir) free(out_dir); free(cue_name); if (vcd_name) free(vcd_name);
 			return 1;
+		}
+		total_written += bytes_read;
+		if (params.verbose && bin_size > 0) {
+			int percent = (int)((total_written * 100) / bin_size);
+			if (percent != last_percent && percent % 10 == 0) {
+				printf("[INFO] Progresso: %d%%\n", percent);
+				last_percent = percent;
+			}
 		}
 	}
 
@@ -502,6 +584,9 @@ int main(int argc, char **argv)
 	free(bin_path);
 	free(headerbuf);
 	free(outbuf);
+	if (out_dir) free(out_dir);
+	free(cue_name);
+	if (vcd_name) free(vcd_name);
 
 	printf("[OK] Converted: %s\n", final_vcd_path);
 	return 0;
