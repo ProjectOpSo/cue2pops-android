@@ -275,7 +275,7 @@ int main(int argc, char **argv)
 	parameters params;
 	memset(&params, 0, sizeof(params));
 
-	printf("\nBIN/CUE to IMAGE0.VCD conversion tool v2.0 (Android/Termux Fixed)\n");
+	printf("\nBIN/CUE to IMAGE0.VCD conversion tool v2.0 (Android/Termux)\n");
 
 	check_available_ram(VCD_HEADER_SIZE + IO_BUFFER_SIZE);
 
