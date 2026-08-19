@@ -34,5 +34,5 @@ Or specify a custom output directory:
 ./cue2pops --output "path/to/folder/" "path/to/file.cue"
 ```
 
-## Credits
-[ErikAndren](https://github.com/ErikAndren)
+This project was based on the Makefu fork.
+[Link](https://github.com/makefu/cue2pops-linux)
