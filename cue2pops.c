@@ -1,7 +1,3 @@
-/* 	BIN/CUE to IMAGE0.VCD conversion tool v2.0 (Android / Termux)
-	Updated for C11 and strict path handling with full error diagnostics.
-*/
-
 #define _POSIX_C_SOURCE 200809L
 #include <stdio.h>
 #include <stdlib.h>
@@ -12,8 +8,11 @@
 #include <time.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/statvfs.h>
 #include <libgen.h>
 #include <ctype.h>
+#include <signal.h>
+#include <unistd.h>
 
 const int SECTORSIZE = 2352; 
 #define VCD_HEADER_SIZE 0x100000
@@ -21,6 +20,8 @@ const int SECTORSIZE = 2352;
 
 int pregap_count = 0; 
 int postgap_count = 0; 
+
+static char g_tmp_vcd_path[1024] = {0};
 
 typedef struct {
 	int vmode;
@@ -53,6 +54,29 @@ static const GameSignature GAME_SIGNATURES[] = {
 };
 static const size_t NUM_SIGNATURES = sizeof(GAME_SIGNATURES) / sizeof(GAME_SIGNATURES[0]);
 
+static void cleanup_tmp_file(void) {
+	if (g_tmp_vcd_path[0] != '\0') {
+		unlink(g_tmp_vcd_path);
+		g_tmp_vcd_path[0] = '\0';
+	}
+}
+
+static void handle_signal(int sig) {
+	(void)sig;
+	cleanup_tmp_file();
+	_exit(130);
+}
+
+static void setup_signals(void) {
+	struct sigaction sa;
+	memset(&sa, 0, sizeof(sa));
+	sa.sa_handler = handle_signal;
+	sigemptyset(&sa.sa_mask);
+	
+	sigaction(SIGINT, &sa, NULL);
+	sigaction(SIGTERM, &sa, NULL);
+}
+
 static void log_error(const char *msg, const char *detail) {
 	if (detail && strlen(detail) > 0) {
 		fprintf(stderr, "[ERROR] %s: %s (errno=%d: %s)\n", msg, detail, errno, strerror(errno));
@@ -67,28 +91,23 @@ static void log_info(const parameters *p, const char *msg) {
 	}
 }
 
-static void check_available_ram(size_t required_bytes) {
-	FILE *fp = fopen("/proc/meminfo", "r");
-	if (!fp) return;
+static int check_disk_space(const char *path, int64_t required_bytes) {
+	struct statvfs stat;
+	char dir_buffer[1024];
+	strncpy(dir_buffer, path, sizeof(dir_buffer) - 1);
+	dir_buffer[sizeof(dir_buffer) - 1] = '\0';
 
-	char line[128];
-	long mem_available_kb = -1;
-
-	while (fgets(line, sizeof(line), fp)) {
-		if (sscanf(line, "MemAvailable: %ld kB", &mem_available_kb) == 1) {
-			break;
-		}
+	char *dir_name = dirname(dir_buffer);
+	if (statvfs(dir_name, &stat) != 0) {
+		return 0; 
 	}
-	fclose(fp);
 
-	if (mem_available_kb > 0) {
-		long required_kb = (long)(required_bytes / 1024);
-		if (mem_available_kb < required_kb) {
-			fprintf(stderr, "[WARNING] Pouca RAM disponível (%ld kB). Recomendado ao menos %ld kB.\n", 
-					mem_available_kb, required_kb);
-			fprintf(stderr, "[WARNING] O processamento pode ficar lento ou ser suspenso pelo Android.\n");
-		}
+	uint64_t available_bytes = (uint64_t)stat.f_bavail * stat.f_frsize;
+	if (available_bytes < (uint64_t)required_bytes) {
+		fprintf(stderr, "[ERROR] Espaço em disco insuficiente. Necessário: %" PRId64 " bytes, Disponível: %" PRIu64 " bytes\n", required_bytes, available_bytes);
+		return -1;
 	}
+	return 0;
 }
 
 static int create_dir_recursive(const char *dir_path) {
@@ -96,7 +115,11 @@ static int create_dir_recursive(const char *dir_path) {
 	char *p = NULL;
 	size_t len;
 
-	snprintf(tmp, sizeof(tmp), "%s", dir_path);
+	if (snprintf(tmp, sizeof(tmp), "%s", dir_path) >= (int)sizeof(tmp)) {
+		fprintf(stderr, "[ERROR] Caminho de diretório muito longo\n");
+		return -1;
+	}
+
 	len = strlen(tmp);
 	if (len == 0) return 0;
 	if (tmp[len - 1] == '/') tmp[len - 1] = 0;
@@ -128,7 +151,7 @@ void game_identifier(unsigned char *inbuf, parameters *p)
 	}
 
 	if (p->game_title == 0) {
-		for (ptr = 0; ptr < IO_BUFFER_SIZE - 16; ptr += 4) {
+		for (ptr = 0; ptr <= IO_BUFFER_SIZE - 16; ptr += 4) {
 			for (size_t s = 0; s < NUM_SIGNATURES; s++) {
 				if (memcmp(&inbuf[ptr], GAME_SIGNATURES[s].sig, GAME_SIGNATURES[s].len) == 0) {
 					printf("----------------------------------------------------------------------------------\n");
@@ -159,14 +182,16 @@ void game_fixer(unsigned char *inbuf, parameters *p)
 {
 	int ptr;
 	if (p->game_fixed == 0) {
-		for (ptr = 0; ptr < IO_BUFFER_SIZE - 8; ptr += 4) {
+		for (ptr = 0; ptr <= IO_BUFFER_SIZE - 8; ptr += 4) {
 			if (p->game_title == 4) {
 				if (inbuf[ptr] == 0x78 && inbuf[ptr+1] == 0x26 && inbuf[ptr+2] == 0x43 && inbuf[ptr+3] == 0x8C) inbuf[ptr] = 0x74;
 				if (inbuf[ptr] == 0xE8 && inbuf[ptr+1] == 0x75 && inbuf[ptr+2] == 0x06 && inbuf[ptr+3] == 0x80) {
-					inbuf[ptr-8] = 0x07;
-					printf("game_fixer : Disc Swap Patched\n");
-					p->game_fixed = 1;
-					break;
+					if (ptr >= 8) {
+						inbuf[ptr-8] = 0x07;
+						printf("game_fixer : Disc Swap Patched\n");
+						p->game_fixed = 1;
+						break;
+					}
 				}
 			}
 		}
@@ -177,7 +202,7 @@ void game_trainer(unsigned char *inbuf, parameters *p)
 {
 	int ptr;
 	if (p->game_trained == 0) {
-		for (ptr = 0; ptr < IO_BUFFER_SIZE - 4; ptr += 4) {
+		for (ptr = 0; ptr <= IO_BUFFER_SIZE - 4; ptr += 4) {
 			if (p->game_title == 1 && inbuf[ptr] == 0x7C && inbuf[ptr+1] == 0x16 && inbuf[ptr+2] == 0x20 && inbuf[ptr+3] == 0xAC) {
 				inbuf[ptr+2] = 0x22;
 				printf("game_trainer : Test Save System Enabled\n");
@@ -270,14 +295,13 @@ int main(int argc, char **argv)
 	unsigned char *outbuf = NULL;
 	int i;
 	int track_count = 0;
-	int sector_count;
 
 	parameters params;
 	memset(&params, 0, sizeof(params));
 
-	printf("\nBIN/CUE to IMAGE0.VCD conversion tool v2.0 (Android/Termux)\n");
+	setup_signals();
 
-	check_available_ram(VCD_HEADER_SIZE + IO_BUFFER_SIZE);
+	printf("\nBIN/CUE to IMAGE0.VCD conversion tool v2.0 (Android/Termux Fixed)\n");
 
 	if (argc <= 1) {
 		printf("Usage: %s [options] <input.cue> [output.vcd]\n", argv[0]);
@@ -322,6 +346,11 @@ int main(int argc, char **argv)
 	}
 
 	char cue_dir[1024] = {0};
+	if (strlen(cue_name) >= sizeof(cue_dir)) {
+		fprintf(stderr, "[ERROR] Input path exceeds buffer limits\n");
+		if (out_dir) free(out_dir); free(cue_name); if (vcd_name) free(vcd_name);
+		return 1;
+	}
 	strncpy(cue_dir, cue_name, sizeof(cue_dir) - 1);
 	char *dir_part = dirname(cue_dir);
 
@@ -360,7 +389,7 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	if (fread(cue_buf, cue_size, 1, cue_file) != 1) {
+	if (fread(cue_buf, 1, cue_size, cue_file) != (size_t)cue_size) {
 		log_error("Failed reading CUE buffer", cue_name);
 		free(cue_buf);
 		fclose(cue_file);
@@ -371,7 +400,16 @@ int main(int argc, char **argv)
 	}
 	fclose(cue_file);
 
-	cue_ptr = strstr(cue_buf, "FILE ");
+	cue_ptr = NULL;
+	for (i = 0; i < cue_size - 4; i++) {
+		if (strncasecmp(&cue_buf[i], "FILE", 4) == 0) {
+			if (i == 0 || isspace((unsigned char)cue_buf[i - 1])) {
+				cue_ptr = &cue_buf[i];
+				break;
+			}
+		}
+	}
+
 	if (!cue_ptr) {
 		fprintf(stderr, "[ERROR] Invalid CUE format: FILE directive not found\n");
 		free(cue_buf);
@@ -382,7 +420,7 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	cue_ptr += 5;
+	cue_ptr += 4;
 	while (*cue_ptr == ' ' || *cue_ptr == '\t') cue_ptr++;
 
 	char extracted_bin[512] = {0};
@@ -397,14 +435,21 @@ int main(int argc, char **argv)
 			if (vcd_name) free(vcd_name);
 			return 1;
 		}
+		if ((size_t)(end_quote - cue_ptr) >= sizeof(extracted_bin)) {
+			fprintf(stderr, "[ERROR] BIN filename in CUE is too long\n");
+			free(cue_buf); if (out_dir) free(out_dir); free(cue_name); if (vcd_name) free(vcd_name);
+			return 1;
+		}
 		strncpy(extracted_bin, cue_ptr, end_quote - cue_ptr);
 	} else {
 		char *end_space = strpbrk(cue_ptr, " \t\r\n");
-		if (end_space) {
-			strncpy(extracted_bin, cue_ptr, end_space - cue_ptr);
-		} else {
-			strncpy(extracted_bin, cue_ptr, sizeof(extracted_bin) - 1);
+		size_t len = end_space ? (size_t)(end_space - cue_ptr) : strlen(cue_ptr);
+		if (len >= sizeof(extracted_bin)) {
+			fprintf(stderr, "[ERROR] BIN filename in CUE is too long\n");
+			free(cue_buf); if (out_dir) free(out_dir); free(cue_name); if (vcd_name) free(vcd_name);
+			return 1;
 		}
+		strncpy(extracted_bin, cue_ptr, len);
 	}
 
 	if (params.debug_cue) {
@@ -422,9 +467,17 @@ int main(int argc, char **argv)
 	}
 
 	if (extracted_bin[0] == '/' || (strlen(extracted_bin) > 2 && extracted_bin[1] == ':')) {
-		snprintf(bin_path, 1024, "%s", extracted_bin);
+		if (snprintf(bin_path, 1024, "%s", extracted_bin) >= 1024) {
+			fprintf(stderr, "[ERROR] BIN path exceeds limits\n");
+			free(cue_buf); free(bin_path); if (out_dir) free(out_dir); free(cue_name); if (vcd_name) free(vcd_name);
+			return 1;
+		}
 	} else {
-		snprintf(bin_path, 1024, "%s/%s", dir_part, extracted_bin);
+		if (snprintf(bin_path, 1024, "%s/%s", dir_part, extracted_bin) >= 1024) {
+			fprintf(stderr, "[ERROR] BIN path exceeds limits\n");
+			free(cue_buf); free(bin_path); if (out_dir) free(out_dir); free(cue_name); if (vcd_name) free(vcd_name);
+			return 1;
+		}
 	}
 
 	if (params.debug_cue) {
@@ -455,7 +508,13 @@ int main(int argc, char **argv)
 
 	char *dot = strrchr(base_vcd_name, '.');
 	if (dot) *dot = '\0';
-	strcat(base_vcd_name, ".VCD");
+	if (strlen(base_vcd_name) + 4 < sizeof(base_vcd_name)) {
+		strcat(base_vcd_name, ".VCD");
+	} else {
+		fprintf(stderr, "[ERROR] Target filename too long\n");
+		free(cue_buf); free(bin_path); if (out_dir) free(out_dir); free(cue_name); if (vcd_name) free(vcd_name);
+		return 1;
+	}
 
 	char final_vcd_path[1024] = {0};
 
@@ -471,14 +530,41 @@ int main(int argc, char **argv)
 		}
 		size_t len = strlen(out_dir);
 		if (out_dir[len - 1] == '/') {
-			snprintf(final_vcd_path, sizeof(final_vcd_path), "%s%s", out_dir, base_vcd_name);
+			if (snprintf(final_vcd_path, sizeof(final_vcd_path), "%s%s", out_dir, base_vcd_name) >= (int)sizeof(final_vcd_path)) {
+				fprintf(stderr, "[ERROR] Output path too long\n");
+				free(cue_buf); free(bin_path); free(out_dir); free(cue_name); if (vcd_name) free(vcd_name);
+				return 1;
+			}
 		} else {
-			snprintf(final_vcd_path, sizeof(final_vcd_path), "%s/%s", out_dir, base_vcd_name);
+			if (snprintf(final_vcd_path, sizeof(final_vcd_path), "%s/%s", out_dir, base_vcd_name) >= (int)sizeof(final_vcd_path)) {
+				fprintf(stderr, "[ERROR] Output path too long\n");
+				free(cue_buf); free(bin_path); free(out_dir); free(cue_name); if (vcd_name) free(vcd_name);
+				return 1;
+			}
 		}
 	} else if (vcd_name) {
-		snprintf(final_vcd_path, sizeof(final_vcd_path), "%s", vcd_name);
+		if (snprintf(final_vcd_path, sizeof(final_vcd_path), "%s", vcd_name) >= (int)sizeof(final_vcd_path)) {
+			fprintf(stderr, "[ERROR] Output path too long\n");
+			free(cue_buf); free(bin_path); free(cue_name); free(vcd_name);
+			return 1;
+		}
 	} else {
-		snprintf(final_vcd_path, sizeof(final_vcd_path), "%s/%s", dir_part, base_vcd_name);
+		if (snprintf(final_vcd_path, sizeof(final_vcd_path), "%s/%s", dir_part, base_vcd_name) >= (int)sizeof(final_vcd_path)) {
+			fprintf(stderr, "[ERROR] Output path too long\n");
+			free(cue_buf); free(bin_path); free(cue_name);
+			return 1;
+		}
+	}
+
+	if (snprintf(g_tmp_vcd_path, sizeof(g_tmp_vcd_path), "%s.tmp", final_vcd_path) >= (int)sizeof(g_tmp_vcd_path)) {
+		fprintf(stderr, "[ERROR] Temporary path exceeds limits\n");
+		free(cue_buf); free(bin_path); if (out_dir) free(out_dir); free(cue_name); if (vcd_name) free(vcd_name);
+		return 1;
+	}
+
+	if (check_disk_space(g_tmp_vcd_path, bin_size + VCD_HEADER_SIZE) != 0) {
+		free(cue_buf); free(bin_path); if (out_dir) free(out_dir); free(cue_name); if (vcd_name) free(vcd_name);
+		return 1;
 	}
 
 	if (params.verbose) {
@@ -503,11 +589,11 @@ int main(int argc, char **argv)
 	headerbuf[12] = 0xA1;
 	headerbuf[22] = 0xA2;
 
-	for (i = 0; i < cue_size - 6; i++) {
-		if (!strncmp(&cue_buf[i], "TRACK ", 6)) track_count++;
-		if (!strncmp(&cue_buf[i], "INDEX 01", 8)) index1_count++;
-		if (!strncmp(&cue_buf[i], "PREGAP", 6)) pregap_count++;
-		if (!strncmp(&cue_buf[i], "POSTGAP", 7)) postgap_count++;
+	for (i = 0; i < cue_size - 5; i++) {
+		if (!strncasecmp(&cue_buf[i], "TRACK", 5)) track_count++;
+		if (!strncasecmp(&cue_buf[i], "INDEX 01", 8)) index1_count++;
+		if (!strncasecmp(&cue_buf[i], "PREGAP", 6)) pregap_count++;
+		if (!strncasecmp(&cue_buf[i], "POSTGAP", 7)) postgap_count++;
 	}
 
 	if (track_count == 0 || track_count != index1_count) {
@@ -525,9 +611,9 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	vcd_file = fopen(final_vcd_path, "wb");
+	vcd_file = fopen(g_tmp_vcd_path, "wb");
 	if (!vcd_file) {
-		log_error("Cannot create VCD output file", final_vcd_path);
+		log_error("Cannot create temporary VCD output file", g_tmp_vcd_path);
 		fclose(bin_file); free(cue_buf); free(bin_path); free(headerbuf);
 		if (out_dir) free(out_dir); free(cue_name); if (vcd_name) free(vcd_name);
 		return 1;
@@ -536,50 +622,94 @@ int main(int argc, char **argv)
 	outbuf = malloc(IO_BUFFER_SIZE);
 	if (!outbuf) {
 		log_error("Cannot allocate conversion buffer", NULL);
-		fclose(bin_file); fclose(vcd_file); free(cue_buf); free(bin_path); free(headerbuf);
+		fclose(bin_file); fclose(vcd_file); cleanup_tmp_file(); free(cue_buf); free(bin_path); free(headerbuf);
 		if (out_dir) free(out_dir); free(cue_name); if (vcd_name) free(vcd_name);
 		return 1;
 	}
 
-	if (fread(outbuf, 1, IO_BUFFER_SIZE, bin_file) > 0) {
-		game_identifier(outbuf, &params);
-		game_fixer(outbuf, &params);
-		game_trainer(outbuf, &params);
+	uint64_t total_sectors = ((uint64_t)bin_size / SECTORSIZE) + (150 * (pregap_count + postgap_count));
+	headerbuf[1032] = (unsigned char)(total_sectors & 0xFF);
+	headerbuf[1033] = (unsigned char)((total_sectors >> 8) & 0xFF);
+	headerbuf[1034] = (unsigned char)((total_sectors >> 16) & 0xFF);
+
+	headerbuf[1036] = (unsigned char)(total_sectors & 0xFF);
+	headerbuf[1037] = (unsigned char)((total_sectors >> 8) & 0xFF);
+	headerbuf[1038] = (unsigned char)((total_sectors >> 16) & 0xFF);
+
+	if (fwrite(headerbuf, 1, VCD_HEADER_SIZE, vcd_file) != VCD_HEADER_SIZE) {
+		log_error("Failed writing VCD header", g_tmp_vcd_path);
+		fclose(bin_file); fclose(vcd_file); cleanup_tmp_file();
+		free(cue_buf); free(bin_path); free(headerbuf); free(outbuf);
+		if (out_dir) free(out_dir); free(cue_name); if (vcd_name) free(vcd_name);
+		return 1;
 	}
-	fseek(bin_file, 0, SEEK_SET);
-
-	sector_count = (bin_size / SECTORSIZE) + (150 * (pregap_count + postgap_count));
-	memcpy(headerbuf + 1032, &sector_count, 3);
-	memcpy(headerbuf + 1036, &sector_count, 3);
-
-	fwrite(headerbuf, VCD_HEADER_SIZE, 1, vcd_file);
 
 	log_info(&params, "Writing BIN sectors to VCD...");
 
-	size_t bytes_read;
-	int64_t total_written = 0;
-	int last_percent = -1;
+	size_t bytes_read = fread(outbuf, 1, IO_BUFFER_SIZE, bin_file);
+	if (bytes_read > 0) {
+		game_identifier(outbuf, &params);
+		game_fixer(outbuf, &params);
+		game_trainer(outbuf, &params);
 
-	while ((bytes_read = fread(outbuf, 1, IO_BUFFER_SIZE, bin_file)) > 0) {
 		if (fwrite(outbuf, 1, bytes_read, vcd_file) != bytes_read) {
-			log_error("Writing failure during VCD creation", final_vcd_path);
-			fclose(bin_file); fclose(vcd_file);
+			log_error("Writing failure during initial block creation", g_tmp_vcd_path);
+			fclose(bin_file); fclose(vcd_file); cleanup_tmp_file();
 			free(cue_buf); free(bin_path); free(headerbuf); free(outbuf);
 			if (out_dir) free(out_dir); free(cue_name); if (vcd_name) free(vcd_name);
 			return 1;
 		}
-		total_written += bytes_read;
-		if (params.verbose && bin_size > 0) {
-			int percent = (int)((total_written * 100) / bin_size);
-			if (percent != last_percent && percent % 10 == 0) {
-				printf("[INFO] Progresso: %d%%\n", percent);
-				last_percent = percent;
-			}
+	} else if (ferror(bin_file)) {
+		log_error("Read error on initial BIN block", bin_path);
+		fclose(bin_file); fclose(vcd_file); cleanup_tmp_file();
+		free(cue_buf); free(bin_path); free(headerbuf); free(outbuf);
+		if (out_dir) free(out_dir); free(cue_name); if (vcd_name) free(vcd_name);
+		return 1;
+	}
+
+	while ((bytes_read = fread(outbuf, 1, IO_BUFFER_SIZE, bin_file)) > 0) {
+		if (fwrite(outbuf, 1, bytes_read, vcd_file) != bytes_read) {
+			log_error("Writing failure during VCD creation", g_tmp_vcd_path);
+			fclose(bin_file); fclose(vcd_file); cleanup_tmp_file();
+			free(cue_buf); free(bin_path); free(headerbuf); free(outbuf);
+			if (out_dir) free(out_dir); free(cue_name); if (vcd_name) free(vcd_name);
+			return 1;
 		}
 	}
 
+	if (ferror(bin_file)) {
+		log_error("Read failure from BIN file", bin_path);
+		fclose(bin_file); fclose(vcd_file); cleanup_tmp_file();
+		free(cue_buf); free(bin_path); free(headerbuf); free(outbuf);
+		if (out_dir) free(out_dir); free(cue_name); if (vcd_name) free(vcd_name);
+		return 1;
+	}
+
+	fflush(vcd_file);
+	int vcd_fd = fileno(vcd_file);
+	if (vcd_fd != -1) {
+		fsync(vcd_fd);
+	}
+
 	fclose(bin_file);
-	fclose(vcd_file);
+	if (fclose(vcd_file) != 0) {
+		log_error("Failed closing output file cleanly", g_tmp_vcd_path);
+		cleanup_tmp_file();
+		free(cue_buf); free(bin_path); free(headerbuf); free(outbuf);
+		if (out_dir) free(out_dir); free(cue_name); if (vcd_name) free(vcd_name);
+		return 1;
+	}
+
+	if (rename(g_tmp_vcd_path, final_vcd_path) != 0) {
+		log_error("Failed moving temporary VCD to final target", final_vcd_path);
+		cleanup_tmp_file();
+		free(cue_buf); free(bin_path); free(headerbuf); free(outbuf);
+		if (out_dir) free(out_dir); free(cue_name); if (vcd_name) free(vcd_name);
+		return 1;
+	}
+
+	g_tmp_vcd_path[0] = '\0';
+
 	free(cue_buf);
 	free(bin_path);
 	free(headerbuf);
