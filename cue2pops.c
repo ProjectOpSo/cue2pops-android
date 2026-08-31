@@ -623,4 +623,71 @@ int main(int argc, char **argv) {
         goto cleanup;
     }
 
-    while (!g_
+    while (!g_interrupted && (bytes_read = fread(outbuf, 1, IO_BUFFER_SIZE, bin_file)) > 0) {
+        if (fwrite(outbuf, 1, bytes_read, vcd_file) != bytes_read) {
+            log_error("Writing failure during VCD creation", tmp_vcd_path);
+            goto cleanup;
+        }
+    }
+
+    if (g_interrupted) {
+        fprintf(stderr, "\n[INFO] Conversion interrupted by user.\n");
+        goto cleanup;
+    }
+
+    if (ferror(bin_file)) {
+        log_error("Read failure from BIN file", bin_path);
+        goto cleanup;
+    }
+
+    if (fflush(vcd_file) != 0) {
+        log_error("Failed flushing output buffer", tmp_vcd_path);
+        goto cleanup;
+    }
+
+    int vcd_fd = fileno(vcd_file);
+    if (vcd_fd != -1) {
+        if (fsync(vcd_fd) != 0) {
+            log_error("Synchronization failed (fsync failed)", tmp_vcd_path);
+            goto cleanup;
+        }
+    }
+
+    if (fclose(vcd_file) != 0) {
+        vcd_file = NULL;
+        log_error("Failed closing output VCD file", tmp_vcd_path);
+        goto cleanup;
+    }
+    vcd_file = NULL;
+
+    fclose(bin_file);
+    bin_file = NULL;
+
+    if (rename(tmp_vcd_path, final_vcd_path) != 0) {
+        log_error("Failed moving temporary VCD to final target", final_vcd_path);
+        goto cleanup;
+    }
+
+    tmp_vcd_path[0] = '\0';
+    printf("[OK] Converted: %s\n", final_vcd_path);
+    exit_code = 0;
+
+cleanup:
+    if (vcd_file) fclose(vcd_file);
+    if (bin_file) fclose(bin_file);
+    if (cue_file) fclose(cue_file);
+
+    if (tmp_vcd_path[0] != '\0') {
+        unlink(tmp_vcd_path);
+    }
+
+    free(cue_buf);
+    free(bin_path);
+    free(headerbuf);
+    free(outbuf);
+    free(out_dir);
+    free(cue_name);
+    free(vcd_name);
+
+    return exit_code;
+}
