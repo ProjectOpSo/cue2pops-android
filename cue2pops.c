@@ -18,6 +18,7 @@ const int SECTORSIZE = 2352;
 #define VCD_HEADER_SIZE 0x100000
 #define IO_BUFFER_SIZE  0x40000
 
+/* Global signal flag for graceful interruption */
 static volatile sig_atomic_t g_interrupted = 0;
 
 static void handle_signal(int sig) {
@@ -89,12 +90,12 @@ static int check_disk_space(const char *path, int64_t required_bytes) {
 
     char *dir_name = dirname(dir_buffer);
     if (statvfs(dir_name, &stat) != 0) {
-        return 0; 
+        return 0; /* Fallback if statvfs is unavailable or fails */
     }
 
     uint64_t available_bytes = (uint64_t)stat.f_bavail * stat.f_frsize;
     if (available_bytes < (uint64_t)required_bytes) {
-        fprintf(stderr, "[ERROR] Espaço em disco insuficiente. Necessário: %" PRId64 " bytes, Disponível: %" PRIu64 " bytes\n", required_bytes, available_bytes);
+        fprintf(stderr, "[ERROR] Insufficient disk space. Required: %" PRId64 " bytes, Available: %" PRIu64 " bytes\n", required_bytes, available_bytes);
         return -1;
     }
     return 0;
@@ -106,7 +107,7 @@ static int create_dir_recursive(const char *dir_path) {
     size_t len;
 
     if (snprintf(tmp, sizeof(tmp), "%s", dir_path) >= (int)sizeof(tmp)) {
-        fprintf(stderr, "[ERROR] Caminho de diretório muito longo\n");
+        fprintf(stderr, "[ERROR] Directory path too long\n");
         return -1;
     }
 
@@ -445,6 +446,12 @@ int main(int argc, char **argv) {
         goto cleanup;
     }
 
+    /* Validate alignment against sector size */
+    if (bin_size % SECTORSIZE != 0) {
+        fprintf(stderr, "[WARNING] BIN file size (%" PRId64 " bytes) is not an exact multiple of SECTORSIZE (%d). Remainder: %" PRId64 " bytes.\n",
+                bin_size, SECTORSIZE, bin_size % SECTORSIZE);
+    }
+
     if (params.verbose) {
         printf("[INFO] Opening BIN file: %s (Size: %" PRId64 " bytes)\n", bin_path, bin_size);
     }
@@ -493,9 +500,9 @@ int main(int argc, char **argv) {
         }
     }
 
-    /* Proteção contra sobrescrita acidental */
+    /* Protection against accidental overwrites */
     if (access(final_vcd_path, F_OK) == 0 && !params.force_overwrite) {
-        fprintf(stderr, "[ERROR] O arquivo final já existe: %s (use -f ou --force para sobrescrever)\n", final_vcd_path);
+        fprintf(stderr, "[ERROR] Target file already exists: %s (use -f or --force to overwrite)\n", final_vcd_path);
         goto cleanup;
     }
 
@@ -504,9 +511,9 @@ int main(int argc, char **argv) {
         goto cleanup;
     }
 
-    /* Tratar .tmp preexistente */
+    /* Remove lingering .tmp file if present */
     if (access(tmp_vcd_path, F_OK) == 0) {
-        log_info(&params, "Removendo arquivo .tmp anterior remanescente...");
+        log_info(&params, "Removing pre-existing temporary .tmp file...");
         unlink(tmp_vcd_path);
     }
 
@@ -531,11 +538,30 @@ int main(int argc, char **argv) {
     headerbuf[12] = 0xA1;
     headerbuf[22] = 0xA2;
 
-    for (int i = 0; i < cue_size - 5; i++) {
-        if (!strncasecmp(&cue_buf[i], "TRACK", 5)) track_count++;
-        if (!strncasecmp(&cue_buf[i], "INDEX 01", 8)) index1_count++;
-        if (!strncasecmp(&cue_buf[i], "PREGAP", 6)) pregap_count++;
-        if (!strncasecmp(&cue_buf[i], "POSTGAP", 7)) postgap_count++;
+    /* Line-by-line line scanning skipping REM comment lines */
+    char *line = cue_buf;
+    while (line && *line) {
+        char *next_line = strchr(line, '\n');
+        if (next_line) {
+            *next_line = '\0';
+        }
+
+        char *trim = line;
+        while (*trim == ' ' || *trim == '\t' || *trim == '\r') trim++;
+
+        if (strncasecmp(trim, "REM", 3) != 0) {
+            if (strcasestr(trim, "TRACK")) track_count++;
+            if (strcasestr(trim, "INDEX 01")) index1_count++;
+            if (strcasestr(trim, "PREGAP")) pregap_count++;
+            if (strcasestr(trim, "POSTGAP")) postgap_count++;
+        }
+
+        if (next_line) {
+            *next_line = '\n';
+            line = next_line + 1;
+        } else {
+            break;
+        }
     }
 
     if (track_count == 0 || track_count != index1_count) {
@@ -563,7 +589,7 @@ int main(int argc, char **argv) {
 
     uint64_t total_sectors = ((uint64_t)bin_size / SECTORSIZE) + (150 * (pregap_count + postgap_count));
     if (total_sectors > 0xFFFFFF) {
-        fprintf(stderr, "[ERROR] Total de setores excede o limite suportado pelo formato VCD\n");
+        fprintf(stderr, "[ERROR] Sector count exceeds VCD header limit.\n");
         goto cleanup;
     }
 
@@ -597,67 +623,4 @@ int main(int argc, char **argv) {
         goto cleanup;
     }
 
-    while (!g_interrupted && (bytes_read = fread(outbuf, 1, IO_BUFFER_SIZE, bin_file)) > 0) {
-        if (fwrite(outbuf, 1, bytes_read, vcd_file) != bytes_read) {
-            log_error("Writing failure during VCD creation", tmp_vcd_path);
-            goto cleanup;
-        }
-    }
-
-    if (g_interrupted) {
-        fprintf(stderr, "\n[INFO] Conversão interrompida pelo usuário.\n");
-        goto cleanup;
-    }
-
-    if (ferror(bin_file)) {
-        log_error("Read failure from BIN file", bin_path);
-        goto cleanup;
-    }
-
-    if (fflush(vcd_file) != 0) {
-        log_error("Failed flushing output buffer", tmp_vcd_path);
-        goto cleanup;
-    }
-
-    int vcd_fd = fileno(vcd_file);
-    if (vcd_fd != -1) {
-        if (fsync(vcd_fd) != 0) {
-            log_error("Falha ao sincronizar arquivo (fsync falhou)", tmp_vcd_path);
-            goto cleanup;
-        }
-    }
-
-    fclose(vcd_file);
-    vcd_file = NULL;
-
-    fclose(bin_file);
-    bin_file = NULL;
-
-    if (rename(tmp_vcd_path, final_vcd_path) != 0) {
-        log_error("Failed moving temporary VCD to final target", final_vcd_path);
-        goto cleanup;
-    }
-
-    tmp_vcd_path[0] = '\0';
-    printf("[OK] Converted: %s\n", final_vcd_path);
-    exit_code = 0;
-
-cleanup:
-    if (vcd_file) fclose(vcd_file);
-    if (bin_file) fclose(bin_file);
-    if (cue_file) fclose(cue_file);
-
-    if (tmp_vcd_path[0] != '\0') {
-        unlink(tmp_vcd_path);
-    }
-
-    free(cue_buf);
-    free(bin_path);
-    free(headerbuf);
-    free(outbuf);
-    free(out_dir);
-    free(cue_name);
-    free(vcd_name);
-
-    return exit_code;
-}
+    while (!g_
