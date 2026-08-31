@@ -1,38 +1,24 @@
-# cue2pops (android / termux)
+# rcue2pops.py (Python Version)
 
-This project is an optimized version of **cue2pops** designed specifically to run on Android devices using the Termux environment.
+This project is a refactored and optimized Python implementation of **cue2pops**, designed to run cross-platform, including Android devices via Termux.
 
-## What is this optimization?
+## Key Improvements
 
-The original tool has been modified and patched to function reliably within the Android Linux emulation environment. 
+The original C codebase has been completely refactored into modern Python with a focus on code safety, maintainability, and clean execution.
 
-### Key Improvements:
-* **Path Handling:** Fixed support for folders and file names containing spaces.
-* **CUE/BIN Parsing:** Corrected the parser to prevent location errors when identifying the target `.bin` file.
-* **Directory Support:** Added native support for automatic output directory creation (`--output`).
-* **Error Messages:** Enhanced verbose terminal output for easier troubleshooting during execution failures.
+* **Native Python Implementation:** No C compilation required—runs directly with Python 3.
+* **Robust File Handling:** Powered by `pathlib` for safe cross-platform path resolution and automatic input/output directory creation.
+* **Smart Resource Management:** Uses contextual file streaming to prevent memory leaks and optimize I/O performance.
+* **Process Interruption Safety:** Supports graceful termination (`SIGINT`/`SIGTERM`) with atomic temporary file replacements to prevent corrupted output files.
+* **Game Patching & Auto-Detection:** Retains built-in support for game signature identification, trainer injections, and compatibility fixes.
 
-## Compilation
+## Requirements
 
-To compile the application inside Termux, run:
-
-```bash
-make
-```
+* Python 3.8 or higher
 
 ## Usage
 
-Convert a game by running:
+Convert a `.cue` file to `.VCD`:
 
 ```bash
-./cue2pops "path/to/file.cue"
-```
-
-Or specify a custom output directory:
-
-```bash
-./cue2pops --output "path/to/folder/" "path/to/file.cue"
-```
-
-This project was based on the Makefu fork.
-[Link](https://github.com/makefu/cue2pops-linux)
+python conv.py "path/to/file.cue"
