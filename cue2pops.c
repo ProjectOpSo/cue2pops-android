@@ -13,6 +13,7 @@
 #include <ctype.h>
 #include <signal.h>
 #include <unistd.h>
+#include <fcntl.h>
 
 const int SECTORSIZE = 2352; 
 #define VCD_HEADER_SIZE 0x100000
@@ -90,7 +91,7 @@ static int check_disk_space(const char *path, int64_t required_bytes) {
 
     char *dir_name = dirname(dir_buffer);
     if (statvfs(dir_name, &stat) != 0) {
-        return 0; /* Fallback if statvfs is unavailable or fails */
+        return 0; /* Fallback se statvfs falhar ou nao estiver disponivel no FS */
     }
 
     uint64_t available_bytes = (uint64_t)stat.f_bavail * stat.f_frsize;
@@ -417,6 +418,41 @@ int main(int argc, char **argv) {
         printf("[DEBUG] FILE directive extracted: %s\n", extracted_bin);
     }
 
+    /* Extração completa das diretivas do CUE antes de liberar o buffer */
+    char *line = cue_buf;
+    while (line && *line) {
+        char *next_line = strchr(line, '\n');
+        if (next_line) {
+            *next_line = '\0';
+        }
+
+        char *trim = line;
+        while (*trim == ' ' || *trim == '\t' || *trim == '\r') trim++;
+
+        if (strncasecmp(trim, "REM", 3) != 0) {
+            if (strcasestr(trim, "TRACK")) track_count++;
+            if (strcasestr(trim, "INDEX 01")) index1_count++;
+            if (strcasestr(trim, "PREGAP")) pregap_count++;
+            if (strcasestr(trim, "POSTGAP")) postgap_count++;
+        }
+
+        if (next_line) {
+            *next_line = '\n';
+            line = next_line + 1;
+        } else {
+            break;
+        }
+    }
+
+    /* Otimização Item 1: Liberar cue_buf imediatamente após extrair todos os dados necessários */
+    free(cue_buf);
+    cue_buf = NULL;
+
+    if (track_count == 0 || track_count != index1_count) {
+        fprintf(stderr, "[ERROR] Invalid CUE structure: Track count mismatch\n");
+        goto cleanup;
+    }
+
     bin_path = malloc(1024);
     if (!bin_path) {
         log_error("Memory allocation failed for BIN path", NULL);
@@ -446,7 +482,6 @@ int main(int argc, char **argv) {
         goto cleanup;
     }
 
-    /* Validate alignment against sector size */
     if (bin_size % SECTORSIZE != 0) {
         fprintf(stderr, "[WARNING] BIN file size (%" PRId64 " bytes) is not an exact multiple of SECTORSIZE (%d). Remainder: %" PRId64 " bytes.\n",
                 bin_size, SECTORSIZE, bin_size % SECTORSIZE);
@@ -458,6 +493,10 @@ int main(int argc, char **argv) {
 
     char base_vcd_name[256] = {0};
     char *tmp_cue_dup = strdup(cue_name);
+    if (!tmp_cue_dup) {
+        log_error("Memory allocation failed for string duplication", NULL);
+        goto cleanup;
+    }
     char *cue_filename = basename(tmp_cue_dup);
     strncpy(base_vcd_name, cue_filename, sizeof(base_vcd_name) - 1);
     free(tmp_cue_dup);
@@ -500,7 +539,6 @@ int main(int argc, char **argv) {
         }
     }
 
-    /* Protection against accidental overwrites */
     if (access(final_vcd_path, F_OK) == 0 && !params.force_overwrite) {
         fprintf(stderr, "[ERROR] Target file already exists: %s (use -f or --force to overwrite)\n", final_vcd_path);
         goto cleanup;
@@ -511,7 +549,6 @@ int main(int argc, char **argv) {
         goto cleanup;
     }
 
-    /* Remove lingering .tmp file if present */
     if (access(tmp_vcd_path, F_OK) == 0) {
         log_info(&params, "Removing pre-existing temporary .tmp file...");
         unlink(tmp_vcd_path);
@@ -523,50 +560,6 @@ int main(int argc, char **argv) {
 
     if (params.verbose) {
         printf("[INFO] Output VCD path: %s\n", final_vcd_path);
-    }
-
-    headerbuf = calloc(1, VCD_HEADER_SIZE);
-    if (!headerbuf) {
-        log_error("Failed to allocate header buffer", NULL);
-        goto cleanup;
-    }
-
-    headerbuf[0] = 0x41;
-    headerbuf[2] = 0xA0;
-    headerbuf[7] = 0x01;
-    headerbuf[8] = 0x20;
-    headerbuf[12] = 0xA1;
-    headerbuf[22] = 0xA2;
-
-    /* Line-by-line line scanning skipping REM comment lines */
-    char *line = cue_buf;
-    while (line && *line) {
-        char *next_line = strchr(line, '\n');
-        if (next_line) {
-            *next_line = '\0';
-        }
-
-        char *trim = line;
-        while (*trim == ' ' || *trim == '\t' || *trim == '\r') trim++;
-
-        if (strncasecmp(trim, "REM", 3) != 0) {
-            if (strcasestr(trim, "TRACK")) track_count++;
-            if (strcasestr(trim, "INDEX 01")) index1_count++;
-            if (strcasestr(trim, "PREGAP")) pregap_count++;
-            if (strcasestr(trim, "POSTGAP")) postgap_count++;
-        }
-
-        if (next_line) {
-            *next_line = '\n';
-            line = next_line + 1;
-        } else {
-            break;
-        }
-    }
-
-    if (track_count == 0 || track_count != index1_count) {
-        fprintf(stderr, "[ERROR] Invalid CUE structure: Track count mismatch\n");
-        goto cleanup;
     }
 
     bin_file = fopen(bin_path, "rb");
@@ -581,11 +574,26 @@ int main(int argc, char **argv) {
         goto cleanup;
     }
 
-    outbuf = malloc(IO_BUFFER_SIZE);
-    if (!outbuf) {
-        log_error("Cannot allocate conversion buffer", NULL);
+    /* Otimização Item 10: Tentar pré-alocar espaço em disco com fallback seguro */
+    int vcd_fd_pre = fileno(vcd_file);
+    if (vcd_fd_pre != -1) {
+#if defined(_POSIX_C_SOURCE) && (_POSIX_C_SOURCE >= 200112L)
+        (void)posix_fallocate(vcd_fd_pre, 0, (off_t)(bin_size + VCD_HEADER_SIZE));
+#endif
+    }
+
+    headerbuf = calloc(1, VCD_HEADER_SIZE);
+    if (!headerbuf) {
+        log_error("Failed to allocate header buffer", NULL);
         goto cleanup;
     }
+
+    headerbuf[0] = 0x41;
+    headerbuf[2] = 0xA0;
+    headerbuf[7] = 0x01;
+    headerbuf[8] = 0x20;
+    headerbuf[12] = 0xA1;
+    headerbuf[22] = 0xA2;
 
     uint64_t total_sectors = ((uint64_t)bin_size / SECTORSIZE) + (150 * (pregap_count + postgap_count));
     if (total_sectors > 0xFFFFFF) {
@@ -603,6 +611,16 @@ int main(int argc, char **argv) {
 
     if (fwrite(headerbuf, 1, VCD_HEADER_SIZE, vcd_file) != VCD_HEADER_SIZE) {
         log_error("Failed writing VCD header", tmp_vcd_path);
+        goto cleanup;
+    }
+
+    /* Otimização Item 5: Liberar headerbuf imediatamente após gravação do cabeçalho no arquivo */
+    free(headerbuf);
+    headerbuf = NULL;
+
+    outbuf = malloc(IO_BUFFER_SIZE);
+    if (!outbuf) {
+        log_error("Cannot allocate conversion buffer", NULL);
         goto cleanup;
     }
 
@@ -630,6 +648,10 @@ int main(int argc, char **argv) {
         }
     }
 
+    /* Otimização Item 5: Liberar buffer de I/O imediatamente após terminar o loop de dados */
+    free(outbuf);
+    outbuf = NULL;
+
     if (g_interrupted) {
         fprintf(stderr, "\n[INFO] Conversion interrupted by user.\n");
         goto cleanup;
@@ -645,6 +667,7 @@ int main(int argc, char **argv) {
         goto cleanup;
     }
 
+    /* Sincronização final única via fsync somente antes do rename */
     int vcd_fd = fileno(vcd_file);
     if (vcd_fd != -1) {
         if (fsync(vcd_fd) != 0) {
@@ -681,13 +704,13 @@ cleanup:
         unlink(tmp_vcd_path);
     }
 
-    free(cue_buf);
-    free(bin_path);
-    free(headerbuf);
-    free(outbuf);
-    free(out_dir);
-    free(cue_name);
-    free(vcd_name);
+    if (cue_buf) free(cue_buf);
+    if (bin_path) free(bin_path);
+    if (headerbuf) free(headerbuf);
+    if (outbuf) free(outbuf);
+    if (out_dir) free(out_dir);
+    if (cue_name) free(cue_name);
+    if (vcd_name) free(vcd_name);
 
     return exit_code;
 }
