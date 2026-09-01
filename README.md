@@ -1,4 +1,4 @@
-# rcue2pops.py (Python Version)
+# cue2pops.py (Python Version)
 
 This project is a refactored and optimized Python implementation of **cue2pops**, designed to run cross-platform, including Android devices via Termux.
 
