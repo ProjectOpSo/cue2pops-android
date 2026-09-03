@@ -21,4 +21,4 @@ The original C codebase has been completely refactored into modern Python with a
 Convert a `.cue` file to `.VCD`:
 
 ```bash
-python conv.py "path/to/file.cue"
+python rcue2pops.py "path/to/file.cue"
