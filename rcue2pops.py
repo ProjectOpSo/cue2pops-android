@@ -14,6 +14,9 @@ SECTORSIZE = 2352
 VCD_HEADER_SIZE = 0x100000
 IO_BUFFER_SIZE = 0x40000
 
+# Script directory reference to locate resources regardless of current working directory
+SCRIPT_DIR = Path(__file__).resolve().parent
+
 # Global flag for graceful process signal interruption
 g_interrupted = False
 
@@ -101,36 +104,39 @@ def check_disk_space(path: Path, required_bytes: int) -> bool:
 
 def write_vcd_header(vcd_file, total_sectors: int):
     """
-    Writes the 1 MiB (0x100000) VCD header without allocating a 1 MiB buffer in RAM.
-    Uses a small buffer for zero-filling and writes the exact same header offsets.
+    Writes the 1 MiB (0x100000) VCD header using a single 64 KiB buffer in RAM.
+    Preserves exact sector offsets at 1032 and 1036 and zero padding.
     """
-    CHUNK_SIZE = 65536  # Small 64 KiB buffer for efficient chunked writing
-    zeros = bytearray(CHUNK_SIZE)
+    CHUNK_SIZE = 65536  # Single 64 KiB buffer reused for writing block0 and zero padding
+    buffer = bytearray(CHUNK_SIZE)
 
-    # Block 0 (First 64 KiB)
-    block0 = bytearray(CHUNK_SIZE)
-    block0[0] = 0x41
-    block0[2] = 0xA0
-    block0[7] = 0x01
-    block0[8] = 0x20
-    block0[12] = 0xA1
-    block0[22] = 0xA2
+    # Populate header metadata in the first block
+    buffer[0] = 0x41
+    buffer[2] = 0xA0
+    buffer[7] = 0x01
+    buffer[8] = 0x20
+    buffer[12] = 0xA1
+    buffer[22] = 0xA2
 
     # Insert sector count indicators into offsets 1032 and 1036
-    block0[1032] = total_sectors & 0xFF
-    block0[1033] = (total_sectors >> 8) & 0xFF
-    block0[1034] = (total_sectors >> 16) & 0xFF
+    buffer[1032] = total_sectors & 0xFF
+    buffer[1033] = (total_sectors >> 8) & 0xFF
+    buffer[1034] = (total_sectors >> 16) & 0xFF
 
-    block0[1036] = total_sectors & 0xFF
-    block0[1037] = (total_sectors >> 8) & 0xFF
-    block0[1038] = (total_sectors >> 16) & 0xFF
+    buffer[1036] = total_sectors & 0xFF
+    buffer[1037] = (total_sectors >> 8) & 0xFF
+    buffer[1038] = (total_sectors >> 16) & 0xFF
 
-    # Write the initial 64 KiB
-    vcd_file.write(block0)
+    # Write the initial 64 KiB block
+    vcd_file.write(buffer)
 
-    # Write the remainder of the 1 MiB header filled with zeros (15 * 64 KiB = 960 KiB)
+    # Zero out the buffer to reuse it for the remaining 960 KiB zero padding
+    for i in range(CHUNK_SIZE):
+        buffer[i] = 0
+
+    # Write remaining 15 blocks (15 * 64 KiB = 960 KiB)
     for _ in range(15):
-        vcd_file.write(zeros)
+        vcd_file.write(buffer)
 
 
 def game_identifier(inbuf: bytearray, p: Parameters):
@@ -208,7 +214,8 @@ def game_trainer(inbuf: bytearray, p: Parameters):
 
 def parse_cue_file(cue_path: Path) -> Tuple[str, int, int, int, int]:
     """
-    Reads the CUE file line-by-line (without reading the entire file into RAM) and extracts directives.
+    Reads the CUE file line-by-line and extracts directives flexibly.
+    Handles single/double quoted filenames, spaces, and standard CUE layouts.
     """
     extracted_bin = None
     track_count = 0
@@ -216,7 +223,7 @@ def parse_cue_file(cue_path: Path) -> Tuple[str, int, int, int, int]:
     pregap_count = 0
     postgap_count = 0
 
-    re_file = re.compile(r'^\s*FILE\s+(?:"([^"]+)"|(\S+))', re.IGNORECASE)
+    re_file = re.compile(r'^\s*FILE\s+(?:"([^"]+)"|\'([^\']+)\'|(\S+))', re.IGNORECASE)
     re_track = re.compile(r'^\s*TRACK\s+\d+', re.IGNORECASE)
     re_index1 = re.compile(r'^\s*INDEX\s+01\b', re.IGNORECASE)
     re_pregap = re.compile(r'^\s*PREGAP\b', re.IGNORECASE)
@@ -231,7 +238,7 @@ def parse_cue_file(cue_path: Path) -> Tuple[str, int, int, int, int]:
             if not extracted_bin:
                 m_file = re_file.match(trimmed)
                 if m_file:
-                    extracted_bin = m_file.group(1) or m_file.group(2)
+                    extracted_bin = m_file.group(1) or m_file.group(2) or m_file.group(3)
 
             if re_track.match(trimmed):
                 track_count += 1
@@ -245,8 +252,9 @@ def parse_cue_file(cue_path: Path) -> Tuple[str, int, int, int, int]:
     if not extracted_bin:
         raise ValueError("Invalid CUE format: FILE directive not found")
 
-    if track_count == 0 or track_count != index1_count:
-        raise ValueError("Invalid CUE structure: TRACK / INDEX 01 count mismatch")
+    # Relaxed condition: require at least 1 track and at least 1 INDEX 01
+    if track_count == 0 or index1_count == 0:
+        raise ValueError("Invalid CUE structure: No valid TRACK or INDEX 01 directives found")
 
     return extracted_bin, track_count, index1_count, pregap_count, postgap_count
 
@@ -256,6 +264,7 @@ def convert_cue_to_vcd(params: Parameters, cue_name: str, vcd_name: Optional[str
     Executes the conversion while maintaining isolation via .tmp, optimized I/O, and thorough error handling.
     """
     global g_interrupted
+    g_interrupted = False  # Reset global flag to prevent inherited cancellation states
 
     cue_path = Path(cue_name).resolve()
     if not cue_path.exists():
@@ -330,8 +339,9 @@ def convert_cue_to_vcd(params: Parameters, cue_name: str, vcd_name: Optional[str
             log_error("Cannot remove pre-existing temporary file", e.strerror)
             return 1
 
-    # Pre-conversion disk space verification
-    required_space = bin_size + VCD_HEADER_SIZE
+    # Pre-conversion disk space verification considering gap sectors
+    extra_gap_sectors = 150 * (pregap_count + postgap_count)
+    required_space = bin_size + VCD_HEADER_SIZE + (extra_gap_sectors * SECTORSIZE)
     if not check_disk_space(tmp_vcd_path, required_space):
         return 1
 
@@ -341,12 +351,12 @@ def convert_cue_to_vcd(params: Parameters, cue_name: str, vcd_name: Optional[str
         with open(bin_path, "rb") as bin_file, open(tmp_vcd_path, "wb") as vcd_file:
             created_tmp = True
 
-            total_sectors = (bin_size // SECTORSIZE) + (150 * (pregap_count + postgap_count))
+            total_sectors = (bin_size // SECTORSIZE) + extra_gap_sectors
             if total_sectors > 0xFFFFFF:
                 sys.stderr.write("[ERROR] Sector count exceeds VCD header limit.\n")
                 return 1
 
-            # Write the 1 MiB header without giant RAM allocations
+            # Write the 1 MiB header using a single 64 KiB buffer
             write_vcd_header(vcd_file, total_sectors)
 
             # Single reusable 256 KiB RAM buffer for the entire I/O lifecycle
