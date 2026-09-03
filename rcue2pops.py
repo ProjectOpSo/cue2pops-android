@@ -1,4 +1,5 @@
 import argparse
+import errno
 import os
 import re
 import signal
@@ -8,8 +9,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Tuple
 
-# Constants defining sector sizes and buffer allocations
-SECTOR_SIZE = 2352
+# Constants defining sector size, header size, and I/O buffer allocation
+SECTORSIZE = 2352
 VCD_HEADER_SIZE = 0x100000
 IO_BUFFER_SIZE = 0x40000
 
@@ -41,6 +42,7 @@ class Parameters:
     gap_less: bool = False
     debug_cue: bool = False
     force_overwrite: bool = False
+    no_sync: bool = False
     
     deny_vmode: int = 0
     fix_game: int = 0
@@ -61,7 +63,6 @@ class GameSignature:
     deny_vmode: int
 
 
-# List of known game signatures for automatic patch application
 GAME_SIGNATURES = [
     GameSignature(b"SCES-00344", "Crash Bandicoot [SCES-00344]", 1, 1),
     GameSignature(b"SCUS-94900", "Crash Bandicoot [SCUS-94900]", 2, 0),
@@ -96,6 +97,40 @@ def check_disk_space(path: Path, required_bytes: int) -> bool:
     except Exception:
         # Fallback to true if disk space inspection is not supported by the filesystem
         return True
+
+
+def write_vcd_header(vcd_file, total_sectors: int):
+    """
+    Writes the 1 MiB (0x100000) VCD header without allocating a 1 MiB buffer in RAM.
+    Uses a small buffer for zero-filling and writes the exact same header offsets.
+    """
+    CHUNK_SIZE = 65536  # Small 64 KiB buffer for efficient chunked writing
+    zeros = bytearray(CHUNK_SIZE)
+
+    # Block 0 (First 64 KiB)
+    block0 = bytearray(CHUNK_SIZE)
+    block0[0] = 0x41
+    block0[2] = 0xA0
+    block0[7] = 0x01
+    block0[8] = 0x20
+    block0[12] = 0xA1
+    block0[22] = 0xA2
+
+    # Insert sector count indicators into offsets 1032 and 1036
+    block0[1032] = total_sectors & 0xFF
+    block0[1033] = (total_sectors >> 8) & 0xFF
+    block0[1034] = (total_sectors >> 16) & 0xFF
+
+    block0[1036] = total_sectors & 0xFF
+    block0[1037] = (total_sectors >> 8) & 0xFF
+    block0[1038] = (total_sectors >> 16) & 0xFF
+
+    # Write the initial 64 KiB
+    vcd_file.write(block0)
+
+    # Write the remainder of the 1 MiB header filled with zeros (15 * 64 KiB = 960 KiB)
+    for _ in range(15):
+        vcd_file.write(zeros)
 
 
 def game_identifier(inbuf: bytearray, p: Parameters):
@@ -173,53 +208,55 @@ def game_trainer(inbuf: bytearray, p: Parameters):
 
 def parse_cue_file(cue_path: Path) -> Tuple[str, int, int, int, int]:
     """
-    Parses a .CUE sheet file to extract the associated BIN filename and calculate track metadata.
+    Reads the CUE file line-by-line (without reading the entire file into RAM) and extracts directives.
     """
-    with open(cue_path, "r", encoding="utf-8", errors="ignore") as f:
-        lines = f.readlines()
-
     extracted_bin = None
     track_count = 0
     index1_count = 0
     pregap_count = 0
     postgap_count = 0
 
-    for line in lines:
-        trimmed = line.strip()
-        if trimmed.upper().startswith("REM"):
-            continue
+    re_file = re.compile(r'^\s*FILE\s+(?:"([^"]+)"|(\S+))', re.IGNORECASE)
+    re_track = re.compile(r'^\s*TRACK\s+\d+', re.IGNORECASE)
+    re_index1 = re.compile(r'^\s*INDEX\s+01\b', re.IGNORECASE)
+    re_pregap = re.compile(r'^\s*PREGAP\b', re.IGNORECASE)
+    re_postgap = re.compile(r'^\s*POSTGAP\b', re.IGNORECASE)
 
-        # Extract the target BIN filename from the FILE directive
-        if not extracted_bin and trimmed.upper().startswith("FILE"):
-            match = re.search(r'FILE\s+"([^"]+)"', line, re.IGNORECASE)
-            if not match:
-                match = re.search(r'FILE\s+(\S+)', line, re.IGNORECASE)
-            if match:
-                extracted_bin = match.group(1)
+    with open(cue_path, "r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            trimmed = line.strip()
+            if not trimmed or trimmed.upper().startswith("REM"):
+                continue
 
-        upper_line = trimmed.upper()
-        if "TRACK" in upper_line:
-            track_count += 1
-        if "INDEX 01" in upper_line:
-            index1_count += 1
-        if "PREGAP" in upper_line:
-            pregap_count += 1
-        if "POSTGAP" in upper_line:
-            postgap_count += 1
+            if not extracted_bin:
+                m_file = re_file.match(trimmed)
+                if m_file:
+                    extracted_bin = m_file.group(1) or m_file.group(2)
+
+            if re_track.match(trimmed):
+                track_count += 1
+            elif re_index1.match(trimmed):
+                index1_count += 1
+            elif re_pregap.match(trimmed):
+                pregap_count += 1
+            elif re_postgap.match(trimmed):
+                postgap_count += 1
 
     if not extracted_bin:
         raise ValueError("Invalid CUE format: FILE directive not found")
 
     if track_count == 0 or track_count != index1_count:
-        raise ValueError("Invalid CUE structure: Track count mismatch")
+        raise ValueError("Invalid CUE structure: TRACK / INDEX 01 count mismatch")
 
     return extracted_bin, track_count, index1_count, pregap_count, postgap_count
 
 
 def convert_cue_to_vcd(params: Parameters, cue_name: str, vcd_name: Optional[str], out_dir: Optional[str]) -> int:
     """
-    Core conversion pipeline from BIN/CUE to POPS VCD format.
+    Executes the conversion while maintaining isolation via .tmp, optimized I/O, and thorough error handling.
     """
+    global g_interrupted
+
     cue_path = Path(cue_name).resolve()
     if not cue_path.exists():
         log_error("Cannot open or access CUE file", cue_name)
@@ -254,16 +291,21 @@ def convert_cue_to_vcd(params: Parameters, cue_name: str, vcd_name: Optional[str
         print(f"[FAIL] {cue_name}")
         return 1
 
-    bin_size = bin_path.stat().st_size
-    if bin_size % SECTOR_SIZE != 0:
+    try:
+        bin_size = bin_path.stat().st_size
+    except OSError as e:
+        log_error("Error reading BIN file info", e.strerror)
+        return 1
+
+    if bin_size % SECTORSIZE != 0:
         print(
             f"[WARNING] BIN file size ({bin_size} bytes) is not an exact multiple of SECTORSIZE "
-            f"({SECTOR_SIZE}). Remainder: {bin_size % SECTOR_SIZE} bytes."
+            f"({SECTORSIZE}). Remainder: {bin_size % SECTORSIZE} bytes."
         )
 
     base_vcd_name = cue_path.stem + ".VCD"
 
-    # Resolve target output paths
+    # Define target output VCD file
     if out_dir:
         out_dir_path = Path(out_dir)
         out_dir_path.mkdir(parents=True, exist_ok=True)
@@ -273,7 +315,7 @@ def convert_cue_to_vcd(params: Parameters, cue_name: str, vcd_name: Optional[str
     else:
         final_vcd_path = dir_part / base_vcd_name
 
-    # Check for target file collision
+    # Ensure original VCD is not overwritten without explicit permission
     if final_vcd_path.exists() and not params.force_overwrite:
         sys.stderr.write(
             f"[ERROR] Target file already exists: {final_vcd_path} (use -f or --force to overwrite)\n"
@@ -282,83 +324,110 @@ def convert_cue_to_vcd(params: Parameters, cue_name: str, vcd_name: Optional[str
 
     tmp_vcd_path = Path(str(final_vcd_path) + ".tmp")
     if tmp_vcd_path.exists():
-        tmp_vcd_path.unlink()
+        try:
+            tmp_vcd_path.unlink()
+        except OSError as e:
+            log_error("Cannot remove pre-existing temporary file", e.strerror)
+            return 1
 
-    # Verify storage requirements
-    if not check_disk_space(tmp_vcd_path, bin_size + VCD_HEADER_SIZE):
+    # Pre-conversion disk space verification
+    required_space = bin_size + VCD_HEADER_SIZE
+    if not check_disk_space(tmp_vcd_path, required_space):
         return 1
+
+    created_tmp = False
 
     try:
         with open(bin_path, "rb") as bin_file, open(tmp_vcd_path, "wb") as vcd_file:
-            # Build and write POPS 1MB VCD header
-            headerbuf = bytearray(VCD_HEADER_SIZE)
-            headerbuf[0] = 0x41
-            headerbuf[2] = 0xA0
-            headerbuf[7] = 0x01
-            headerbuf[8] = 0x20
-            headerbuf[12] = 0xA1
-            headerbuf[22] = 0xA2
+            created_tmp = True
 
-            total_sectors = (bin_size // SECTOR_SIZE) + (150 * (pregap_count + postgap_count))
+            total_sectors = (bin_size // SECTORSIZE) + (150 * (pregap_count + postgap_count))
             if total_sectors > 0xFFFFFF:
                 sys.stderr.write("[ERROR] Sector count exceeds VCD header limit.\n")
                 return 1
 
-            # Populate sector count indicators inside header
-            headerbuf[1032] = total_sectors & 0xFF
-            headerbuf[1033] = (total_sectors >> 8) & 0xFF
-            headerbuf[1034] = (total_sectors >> 16) & 0xFF
+            # Write the 1 MiB header without giant RAM allocations
+            write_vcd_header(vcd_file, total_sectors)
 
-            headerbuf[1036] = total_sectors & 0xFF
-            headerbuf[1037] = (total_sectors >> 8) & 0xFF
-            headerbuf[1038] = (total_sectors >> 16) & 0xFF
+            # Single reusable 256 KiB RAM buffer for the entire I/O lifecycle
+            io_buffer = bytearray(IO_BUFFER_SIZE)
 
-            vcd_file.write(headerbuf)
-            del headerbuf  # Free header memory buffer immediately
+            # Process and patch the first block
+            n_first = bin_file.readinto(io_buffer)
+            if n_first > 0:
+                first_view = io_buffer[:n_first]
+                game_identifier(first_view, params)
+                game_fixer(first_view, params)
+                game_trainer(first_view, params)
+                vcd_file.write(first_view)
 
-            # Process and patch the first I/O block
-            first_block = bytearray(bin_file.read(IO_BUFFER_SIZE))
-            if first_block:
-                game_identifier(first_block, params)
-                game_fixer(first_block, params)
-                game_trainer(first_block, params)
-                vcd_file.write(first_block)
-
-            # Main I/O transfer loop
+            # Main transfer loop using readinto with the same io_buffer instance
             while not g_interrupted:
-                chunk = bin_file.read(IO_BUFFER_SIZE)
-                if not chunk:
+                n_read = bin_file.readinto(io_buffer)
+                if n_read == 0:
                     break
-                vcd_file.write(chunk)
+                vcd_file.write(io_buffer[:n_read])
 
             if g_interrupted:
                 sys.stderr.write("\n[INFO] Conversion interrupted by user.\n")
                 return 1
 
             vcd_file.flush()
-            os.fsync(vcd_file.fileno())
+            if not params.no_sync:
+                os.fsync(vcd_file.fileno())
 
-        # Atomic move from temporary file to final target VCD
+        # Atomic replacement: move from VCD.tmp to final target VCD
         tmp_vcd_path.replace(final_vcd_path)
-        print(f"[OK] Converted: {final_vcd_path}")
+        print(f"[OK] Converted successfully: {final_vcd_path}")
         return 0
 
-    except Exception as e:
-        log_error("Error during conversion process", str(e))
-        if tmp_vcd_path.exists():
-            tmp_vcd_path.unlink()
+    except OSError as e:
+        if e.errno == errno.ENOSPC:
+            sys.stderr.write("[ERROR] Conversion failed: Insufficient disk space (ENOSPC).\n")
+        elif e.errno == errno.ENOMEM:
+            sys.stderr.write("[ERROR] Conversion failed: Out of memory (ENOMEM).\n")
+        elif e.errno == errno.EACCES:
+            sys.stderr.write("[ERROR] Conversion failed: Permission denied (EACCES).\n")
+        elif e.errno == errno.EIO:
+            sys.stderr.write("[ERROR] Conversion failed: Physical I/O error (EIO).\n")
+        else:
+            log_error("I/O error during conversion process", e.strerror)
+
+        if created_tmp and tmp_vcd_path.exists():
+            try:
+                tmp_vcd_path.unlink()
+            except OSError:
+                pass
         return 1
+
+    except Exception as e:
+        log_error("Unexpected error during conversion process", str(e))
+        if created_tmp and tmp_vcd_path.exists():
+            try:
+                tmp_vcd_path.unlink()
+            except OSError:
+                pass
+        return 1
+
+    finally:
+        # Guarantee cleanup of .tmp if the process was interrupted or failed
+        if (g_interrupted or not final_vcd_path.exists()) and created_tmp and tmp_vcd_path.exists():
+            try:
+                tmp_vcd_path.unlink()
+            except OSError:
+                pass
 
 
 def main():
     """
     Main entry point and CLI argument parser configuration.
     """
-    parser = argparse.ArgumentParser(description="BIN/CUE to IMAGE0.VCD conversion tool (Python Version)")
+    parser = argparse.ArgumentParser(description="BIN/CUE to IMAGE0.VCD conversion tool (POPS)")
     parser.add_argument("cue_name", help="Input .cue file path")
     parser.add_argument("vcd_name", nargs="?", default=None, help="Output .vcd file path (optional)")
     parser.add_argument("-o", "--output", dest="out_dir", help="Custom output directory")
     parser.add_argument("-f", "--force", action="store_true", help="Overwrite existing output VCD")
+    parser.add_argument("--no-sync", action="store_true", help="Disable final fsync for maximum speed")
     parser.add_argument("--debug-cue", action="store_true", help="Detailed CUE/BIN path debugging")
     parser.add_argument("extra_args", nargs="*", help="Additional legacy options (vmode, trainer, gap++, gap--)")
 
@@ -367,8 +436,8 @@ def main():
     params = Parameters()
     params.debug_cue = args.debug_cue
     params.force_overwrite = args.force
+    params.no_sync = args.no_sync
 
-    # Parse positional legacy flags
     for arg in args.extra_args:
         if arg == "gap++":
             params.gap_more = True
